@@ -76,6 +76,9 @@ public:
 	bool IsHistogram()
 	{ return m_channel.GetYAxisUnits() == Unit(Unit::UNIT_COUNTS_SCI); }
 
+	bool WantsZeroHold()
+	{ return m_channel.GetYAxisUnits() == Unit(Unit::UNIT_FS); }
+
 	bool IsDensePacked()
 	{
 		auto data = m_channel.m_channel->GetData(0);
@@ -352,6 +355,7 @@ protected:
 	void RenderTrace(WaveformRenderData* wdata);
 	void InitializeWaveformPass();
 	Program m_analogWaveformComputeProgram;
+	Program m_zeroHoldAnalogWaveformComputeProgram;
 	Program m_denseAnalogWaveformComputeProgram;
 	Program m_digitalWaveformComputeProgram;
 	Program m_histogramWaveformComputeProgram;

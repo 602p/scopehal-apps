@@ -490,6 +490,7 @@ bool WaveformArea::on_render(const Glib::RefPtr<Gdk::GLContext>& /*context*/)
 	m_histogramWaveformComputeProgram.MemoryBarrier();
 	m_denseAnalogWaveformComputeProgram.MemoryBarrier();
 	m_analogWaveformComputeProgram.MemoryBarrier();
+	m_zeroHoldAnalogWaveformComputeProgram.MemoryBarrier();
 
 	//Final compositing of data being drawn to the screen
 	m_windowFramebuffer.Bind(GL_FRAMEBUFFER);
@@ -668,6 +669,8 @@ Program* WaveformArea::GetProgramForWaveform(WaveformRenderData* data)
 		return &m_digitalWaveformComputeProgram;
 	else if(data->IsHistogram())
 		return &m_histogramWaveformComputeProgram;
+	else if(data->WantsZeroHold())
+		return &m_zeroHoldAnalogWaveformComputeProgram;
 	else if(data->IsDensePacked())
 		return &m_denseAnalogWaveformComputeProgram;
 	else
