@@ -109,6 +109,7 @@ void main()
 
 					#else
 						#define DIGITAL_PATH
+						// Jump to digital path below for correct no-interpolation logic
 					#endif
 
 				#endif
