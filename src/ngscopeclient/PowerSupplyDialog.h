@@ -39,6 +39,8 @@
 #include "RollingBuffer.h"
 #include "Session.h"
 
+#include <future>
+
 /**
 	@brief UI state for a single power supply channel
 
@@ -51,21 +53,33 @@ public:
 	bool m_overcurrentShutdownEnabled;
 	bool m_softStartEnabled;
 
-	float m_setVoltage;
-	float m_setCurrent;
+	std::string m_setVoltage;
+	std::string m_setCurrent;
 
-	float m_lastAppliedSetVoltage;
-	float m_lastAppliedSetCurrent;
+	float m_committedSetVoltage;
+	float m_committedSetCurrent;
+
+	PowerSupplyChannelUIState()
+		: m_outputEnabled(false)
+		, m_overcurrentShutdownEnabled(false)
+		, m_setVoltage("")
+		, m_setCurrent("")
+		, m_committedSetVoltage(0)
+		, m_committedSetCurrent(0)
+	{}
 
 	PowerSupplyChannelUIState(SCPIPowerSupply* psu, int chan)
 		: m_outputEnabled(psu->GetPowerChannelActive(chan))
 		, m_overcurrentShutdownEnabled(psu->GetPowerOvercurrentShutdownEnabled(chan))
 		, m_softStartEnabled(psu->IsSoftStartEnabled(chan))
-		, m_setVoltage(psu->GetPowerVoltageNominal(chan))
-		, m_setCurrent(psu->GetPowerCurrentNominal(chan))
-		, m_lastAppliedSetVoltage(m_setVoltage)
-		, m_lastAppliedSetCurrent(m_setCurrent)
-	{}
+		, m_committedSetVoltage(psu->GetPowerVoltageNominal(chan))
+		, m_committedSetCurrent(psu->GetPowerCurrentNominal(chan))
+	{
+		Unit volts(Unit::UNIT_VOLTS);
+		Unit amps(Unit::UNIT_AMPS);
+		m_setVoltage = volts.PrettyPrint(m_committedSetVoltage);
+		m_setCurrent = amps.PrettyPrint(m_committedSetCurrent);
+	}
 
 	RollingBuffer m_voltageHistory;
 	RollingBuffer m_currentHistory;
@@ -100,6 +114,9 @@ protected:
 
 	///@brief Current channel stats, live updated
 	std::shared_ptr<PowerSupplyState> m_state;
+
+	//Future channel state during loading
+	std::vector<std::future<PowerSupplyChannelUIState> > m_futureUIState;
 
 	///@brief Channel state for the UI
 	std::vector<PowerSupplyChannelUIState> m_channelUIState;

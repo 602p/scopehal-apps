@@ -43,21 +43,67 @@
 class WaveformGroup
 {
 public:
-	WaveformGroup(const std::string& title, size_t numAreas);
+	WaveformGroup(MainWindow* parent, const std::string& title);
 	virtual ~WaveformGroup();
 
-	void Render();
+	bool Render();
 
 	const std::string& GetTitle()
 	{ return m_title; }
 
+	void AddArea(std::shared_ptr<WaveformArea>& area);
+
+	void OnZoomInHorizontal(int64_t target, float step);
+	void OnZoomOutHorizontal(int64_t target, float step);
+
+	/**
+		@brief Converts a position in X axis units (relative to time zero) to pixels (relative to left side of plot)
+	 */
+	int64_t XPositionToXAxisUnits(float pix)
+	{ return m_xAxisOffset + PixelsToXAxisUnits(pix); }
+
+	/**
+		@brief Converts a distance measurement in pixels to X axis units
+	 */
+	int64_t PixelsToXAxisUnits(float pix)
+	{ return pix / m_pixelsPerXUnit; }
+
+	/**
+		@brief Converts a distance measurement in X axis units to pixels
+	 */
+	float XAxisUnitsToPixels(int64_t t)
+	{ return t * m_pixelsPerXUnit; }
+
+	void ClearPersistence();
+
 protected:
+	void RenderTimeline(float width, float height);
+	int64_t GetRoundingDivisor(int64_t width_xunits);
+	void OnMouseWheel(float delta);
+
+	///@brief Top level window we're attached to
+	MainWindow* m_parent;
+
+	///@brief Display scale factor
+	float m_pixelsPerXUnit;
+
+	///@brief X axis position of the left edge of our view
+	int64_t m_xAxisOffset;
 
 	///@brief Display title of the group
 	std::string m_title;
 
+	///@brief X axis unit
+	Unit m_xAxisUnit;
+
 	///@brief The set of waveform areas within this group
 	std::vector< std::shared_ptr<WaveformArea> > m_areas;
+
+	///@brief True if dragging timeline
+	bool m_draggingTimeline;
+
+	///@brief Time of last mouse movement
+	double m_tLastMouseMove;
 };
 
 #endif

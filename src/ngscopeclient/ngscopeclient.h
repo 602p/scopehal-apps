@@ -45,8 +45,24 @@
 
 #include <atomic>
 
+#include "RFSignalGeneratorState.h"
 #include "PowerSupplyState.h"
 #include "MultimeterState.h"
+#include "GuiLogSink.h"
+
+class RFSignalGeneratorThreadArgs
+{
+public:
+	RFSignalGeneratorThreadArgs(SCPIRFSignalGenerator* p, std::atomic<bool>* s, std::shared_ptr<RFSignalGeneratorState> st)
+	: gen(p)
+	, shuttingDown(s)
+	, state(st)
+	{}
+
+	SCPIRFSignalGenerator* gen;
+	std::atomic<bool>* shuttingDown;
+	std::shared_ptr<RFSignalGeneratorState> state;
+};
 
 class PowerSupplyThreadArgs
 {
@@ -79,5 +95,6 @@ public:
 void ScopeThread(Oscilloscope* scope, std::atomic<bool>* shuttingDown);
 void PowerSupplyThread(PowerSupplyThreadArgs args);
 void MultimeterThread(MultimeterThreadArgs args);
+void RFSignalGeneratorThread(RFSignalGeneratorThreadArgs args);
 
 #endif

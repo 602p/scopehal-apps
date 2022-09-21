@@ -38,6 +38,7 @@
 #include "FunctionGeneratorDialog.h"
 #include "MultimeterDialog.h"
 #include "PowerSupplyDialog.h"
+#include "RFGeneratorDialog.h"
 
 using namespace std;
 
@@ -53,6 +54,11 @@ Session::Session(MainWindow* wnd)
 
 Session::~Session()
 {
+	Clear();
+}
+
+void Session::Clear()
+{
 	//Signal our threads to exit
 	m_shuttingDown = true;
 
@@ -66,6 +72,11 @@ Session::~Session()
 		delete scope;
 	m_oscilloscopes.clear();
 	m_psus.clear();
+	m_rfgenerators.clear();
+	m_meters.clear();
+
+	//Clear shutdown flag in case we're reusing the session object
+	m_shuttingDown = false;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -79,6 +90,7 @@ void Session::AddOscilloscope(Oscilloscope* scope)
 	m_threads.push_back(make_unique<thread>(ScopeThread, scope, &m_shuttingDown));
 
 	m_mainWindow->AddToRecentInstrumentList(dynamic_cast<SCPIOscilloscope*>(scope));
+	m_mainWindow->OnScopeAdded(scope);
 }
 
 /**
@@ -114,7 +126,7 @@ void Session::AddMultimeter(SCPIMultimeter* meter)
 {
 	m_modifiedSinceLastSave = true;
 
-	//Create shared PSU state
+	//Create shared meter state
 	auto state = make_shared<MultimeterState>();
 	m_meters[meter] = make_unique<MultimeterConnectionState>(meter, state);
 
@@ -162,7 +174,76 @@ void Session::RemoveFunctionGenerator(SCPIFunctionGenerator* generator)
 		}
 	}
 
-	//Free it iff it's not part of an oscilloscope
-	if(dynamic_cast<Oscilloscope*>(generator) == nullptr)
+	//Free it iff it's not part of an oscilloscope or RF signal generator
+	if( (dynamic_cast<Oscilloscope*>(generator) == nullptr) && (dynamic_cast<RFSignalGenerator*>(generator) == nullptr) )
 		delete generator;
+}
+
+/**
+	@brief Adds an RF signal generator to the session
+ */
+void Session::AddRFGenerator(SCPIRFSignalGenerator* generator)
+{
+	m_modifiedSinceLastSave = true;
+
+	//Create shared meter state
+	auto state = make_shared<RFSignalGeneratorState>(generator->GetChannelCount());
+	m_rfgenerators[generator] = make_unique<RFSignalGeneratorConnectionState>(generator, state);
+
+	m_mainWindow->AddDialog(make_shared<RFGeneratorDialog>(generator, state, this));
+
+	m_mainWindow->AddToRecentInstrumentList(generator);
+}
+
+/**
+	@brief Removes an RF signal from the session
+ */
+void Session::RemoveRFGenerator(SCPIRFSignalGenerator* generator)
+{
+	m_modifiedSinceLastSave = true;
+
+	//If the generator is also a function generator, delete that too
+	//FIXME: This is not the best UX. Would be best to ref count and delete when both are closed
+	auto func = dynamic_cast<SCPIFunctionGenerator*>(generator);
+	if(func != nullptr)
+	{
+		RemoveFunctionGenerator(func);
+		m_mainWindow->RemoveFunctionGenerator(func);
+	}
+
+	m_rfgenerators.erase(generator);
+}
+
+/**
+	@brief Returns a list of all connected instruments, of any type
+
+	Multi-type instruments are only counted once.
+ */
+set<SCPIInstrument*> Session::GetSCPIInstruments()
+{
+	set<SCPIInstrument*> insts;
+	for(auto& scope : m_oscilloscopes)
+	{
+		auto s = dynamic_cast<SCPIInstrument*>(scope);
+		if(s != nullptr)
+			insts.emplace(s);
+	}
+	for(auto& it : m_psus)
+	{
+		auto s = dynamic_cast<SCPIInstrument*>(it.first);
+		if(s != nullptr)
+			insts.emplace(s);
+	}
+	for(auto& it : m_meters)
+	{
+		auto s = dynamic_cast<SCPIInstrument*>(it.first);
+		if(s != nullptr)
+			insts.emplace(s);
+	}
+	for(auto& it : m_rfgenerators)
+		insts.emplace(it.first);
+	for(auto gen : m_generators)
+		insts.emplace(gen);
+
+	return insts;
 }

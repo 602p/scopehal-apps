@@ -41,6 +41,8 @@ using namespace std;
 
 unique_ptr<MainWindow> g_mainWindow;
 
+GuiLogSink* g_guiLog;
+
 #ifndef _WIN32
 void Relaunch(int argc, char* argv[]);
 #endif
@@ -63,7 +65,9 @@ int main(int argc, char* argv[])
 	}
 
 	//Set up logging
-	g_log_sinks.emplace(g_log_sinks.begin(), new ColoredSTDLogSink(console_verbosity));
+	g_guiLog = new GuiLogSink(console_verbosity);
+	g_log_sinks.push_back(make_unique<ColoredSTDLogSink>(console_verbosity));
+	g_log_sinks.push_back(unique_ptr<GuiLogSink>(g_guiLog));
 
 	//Complain if the OpenMP wait policy isn't set right
 	const char* policy = getenv("OMP_WAIT_POLICY");
@@ -124,24 +128,9 @@ int main(int argc, char* argv[])
 	style.Colors[ImGuiCol_WindowBg].w = 1.0f;
 
 	{
-		//Make buffers etc for rendering
-		vk::CommandPoolCreateInfo poolInfo(
-			vk::CommandPoolCreateFlagBits::eTransient | vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-			g_renderQueueType );
-		vk::raii::CommandPool pool(*g_vkComputeDevice, poolInfo);
-		vk::CommandBufferAllocateInfo bufinfo(*pool, vk::CommandBufferLevel::ePrimary, 1);
-		vk::raii::CommandBuffer cmdBuf(move(vk::raii::CommandBuffers(*g_vkComputeDevice, bufinfo).front()));
-		vk::raii::Queue queue(*g_vkComputeDevice, g_renderQueueType, AllocateVulkanRenderQueue());
-
 		//Make the top level window
+		vk::raii::Queue queue(*g_vkComputeDevice, g_renderQueueType, AllocateVulkanRenderQueue());
 		g_mainWindow = make_unique<MainWindow>(queue);
-
-		//Download Vulkan fonts
-		cmdBuf.begin({});
-		ImGui_ImplVulkan_CreateFontsTexture(*cmdBuf);
-		cmdBuf.end();
-		SubmitAndBlock(cmdBuf, queue);
-		ImGui_ImplVulkan_DestroyFontUploadObjects();
 
 		//Main event loop
 		while(!glfwWindowShouldClose(g_mainWindow->GetWindow()))

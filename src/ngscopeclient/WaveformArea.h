@@ -35,21 +35,43 @@
 #ifndef WaveformArea_h
 #define WaveformArea_h
 
+class WaveformArea;
+class WaveformGroup;
+class MainWindow;
+
+/**
+	@brief Drag context for a waveform being dragged
+ */
+class WaveformDragContext
+{
+public:
+	WaveformDragContext(WaveformArea* src)
+	: m_sourceArea(src)
+	, m_streamIndex(0)
+	{}
+
+	WaveformArea* m_sourceArea;
+	size_t m_streamIndex;
+};
+
 /**
 	@brief Placeholder for a single channel being displayed within a WaveformArea
  */
 class DisplayedChannel
 {
 public:
-	DisplayedChannel(const std::string& name)
-		: m_name(name)
+	DisplayedChannel(StreamDescriptor stream)
+		: m_stream(stream)
 	{}
 
-	const std::string& GetName()
-	{ return m_name; }
+	std::string GetName()
+	{ return m_stream.GetName(); }
+
+	StreamDescriptor GetStream()
+	{ return m_stream; }
 
 protected:
-	std::string m_name;
+	StreamDescriptor m_stream;
 };
 
 /**
@@ -60,15 +82,65 @@ protected:
 class WaveformArea
 {
 public:
-	WaveformArea();
+	WaveformArea(StreamDescriptor stream, std::shared_ptr<WaveformGroup> group, MainWindow* parent);
 	virtual ~WaveformArea();
 
-	void Render(int iArea, int numAreas, ImVec2 clientArea);
+	bool Render(int iArea, int numAreas, ImVec2 clientArea);
+
+	StreamDescriptor GetStream(size_t i)
+	{ return m_displayedChannels[i]->GetStream(); }
+
+	void AddStream(StreamDescriptor desc);
+
+	void RemoveStream(size_t i);
+
+	void ClearPersistence();
 
 protected:
-	void DraggableButton(std::shared_ptr<DisplayedChannel> chan);
+	void DraggableButton(std::shared_ptr<DisplayedChannel> chan, size_t index);
+	void RenderBackgroundGradient(ImVec2 start, ImVec2 size);
+	void RenderGrid(ImVec2 start, ImVec2 size, std::map<float, float>& gridmap, float& vbot, float& vtop);
+	void RenderYAxis(ImVec2 size, std::map<float, float>& gridmap, float vbot, float vtop);
 
-	void DropArea(const std::string& name, ImVec2 start, ImVec2 size);
+	void DragDropOverlays(int iArea, int numAreas);
+	void CenterDropArea(ImVec2 start, ImVec2 size);
+	void EdgeDropArea(const std::string& name, ImVec2 start, ImVec2 size, ImGuiDir splitDir);
+
+	float PixelsToYAxisUnits(float pix);
+	float YAxisUnitsToPixels(float volt);
+	float YAxisUnitsToYPosition(float volt);
+	float YPositionToYAxisUnits(float y);
+	float PickStepSize(float volts_per_half_span, int min_steps = 2, int max_steps = 5);
+
+	StreamDescriptor GetFirstAnalogStream();
+	StreamDescriptor GetFirstAnalogOrEyeStream();
+
+	///@brief Cached plot height
+	float m_height;
+
+	///@brief Cached Y axis offset
+	float m_yAxisOffset;
+
+	///@brief Cached midpoint of the plot
+	float m_ymid;
+
+	///@brief Cached Y axis scale
+	float m_pixelsPerYAxisUnit;
+
+	///@brief Cached Y axis unit
+	Unit m_yAxisUnit;
+
+	///@brief Drag and drop of UI elements
+	enum
+	{
+		DRAG_STATE_NONE,
+		DRAG_STATE_Y_AXIS
+	} m_dragState;
+
+	void OnMouseWheelPlotArea(float delta);
+	void OnMouseWheelYAxis(float delta);
+	void OnMouseUp();
+	void OnDragUpdate();
 
 	/**
 		@brief The channels currently living within this WaveformArea
@@ -76,6 +148,18 @@ protected:
 		TODO: make this a FlowGraphNode and just hook up inputs
 	 */
 	std::vector<std::shared_ptr<DisplayedChannel>> m_displayedChannels;
+
+	///@brief Drag context for waveform we're dragging
+	WaveformDragContext m_dragContext;
+
+	///@brief Waveform group containing us
+	std::shared_ptr<WaveformGroup> m_group;
+
+	///@brief Top level window object containing us
+	MainWindow* m_parent;
+
+	///@brief Time of last mouse movement
+	double m_tLastMouseMove;
 };
 
 #endif

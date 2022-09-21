@@ -99,7 +99,7 @@ jobs:
         cd msys2
         MINGW_ARCH=mingw64 makepkg-mingw --noconfirm --noprogressbar -sCLf
 
-    - name: Test
+    - name: Test 
       shell: msys2 {0}
       run: |
         pacman -U --noconfirm msys2/*.zst
@@ -118,6 +118,7 @@ jobs:
         cd build_msi
         cmake \
           -G"Ninja" \
+          -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_TESTING=OFF \
           -DWIXPATH="/c/Program Files (x86)/WiX Toolset v3.11/bin" \
           ../

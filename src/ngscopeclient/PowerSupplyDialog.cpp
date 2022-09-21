@@ -37,6 +37,7 @@
 #include "PowerSupplyDialog.h"
 
 using namespace std;
+using namespace std::chrono_literals;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Construction / destruction
@@ -50,8 +51,12 @@ PowerSupplyDialog::PowerSupplyDialog(SCPIPowerSupply* psu, shared_ptr<PowerSuppl
 	, m_psu(psu)
 	, m_state(state)
 {
+	//Set up initial empty state
+	m_channelUIState.resize(m_psu->GetPowerChannelCount());
+
+	//Asynchronously load rest of the state
 	for(int i=0; i<m_psu->GetPowerChannelCount(); i++)
-		m_channelUIState.push_back(PowerSupplyChannelUIState(m_psu, i));
+		m_futureUIState.push_back(async(launch::async, [psu, i]{ return PowerSupplyChannelUIState(psu, i); }));
 }
 
 PowerSupplyDialog::~PowerSupplyDialog()
@@ -99,6 +104,31 @@ bool PowerSupplyDialog::DoRender()
 			"This acts as a second switch in series with the per-channel output enables.");
 	}
 
+	//Grab asynchronously loaded channel state if it's ready
+	if(m_futureUIState.size())
+	{
+		bool allDone = true;
+		for(size_t i=0; i<m_futureUIState.size(); i++)
+		{
+			//Already loaded? No action needed
+			if(m_channelUIState[i].m_setVoltage != "")
+				continue;
+
+			//Not ready? Keep waiting
+			if(m_futureUIState[i].wait_for(0s) != future_status::ready)
+			{
+				allDone = false;
+				continue;
+			}
+
+			//Ready, process it
+			m_channelUIState[i] = m_futureUIState[i].get();
+		}
+
+		if(allDone)
+			m_futureUIState.clear();
+	}
+
 	auto t = GetTime() - m_tstart;
 	bool firstUpdateDone = m_state->m_firstUpdateDone.load();
 
@@ -140,6 +170,9 @@ void PowerSupplyDialog::ChannelSettings(int i, float v, float a, float etime)
 	float valueWidth = 100;
 
 	auto chname = m_psu->GetPowerChannelName(i);
+
+	Unit volts(Unit::UNIT_VOLTS);
+	Unit amps(Unit::UNIT_AMPS);
 
 	if(ImGui::CollapsingHeader(chname.c_str(), ImGuiTreeNodeFlags_DefaultOpen))
 	{
@@ -192,13 +225,19 @@ void PowerSupplyDialog::ChannelSettings(int i, float v, float a, float etime)
 		if(ImGui::TreeNode("Set Points"))
 		{
 			ImGui::SetNextItemWidth(valueWidth);
-			if(FloatInputWithApplyButton("V", m_channelUIState[i].m_setVoltage, m_channelUIState[i].m_lastAppliedSetVoltage))
-				m_psu->SetPowerVoltage(i, m_channelUIState[i].m_setVoltage);
+			if(UnitInputWithExplicitApply(
+				"Voltage", m_channelUIState[i].m_setVoltage, m_channelUIState[i].m_committedSetVoltage, volts))
+			{
+				m_psu->SetPowerVoltage(i, m_channelUIState[i].m_committedSetVoltage);
+			}
 			HelpMarker("Target voltage to be supplied to the load.\n\nChanges are not pushed to hardware until you click Apply.");
 
 			ImGui::SetNextItemWidth(valueWidth);
-			if(FloatInputWithApplyButton("A", m_channelUIState[i].m_setCurrent, m_channelUIState[i].m_lastAppliedSetCurrent))
-				m_psu->SetPowerVoltage(i, m_channelUIState[i].m_setCurrent);
+			if(UnitInputWithExplicitApply(
+				"Current", m_channelUIState[i].m_setCurrent, m_channelUIState[i].m_committedSetCurrent, amps))
+			{
+				m_psu->SetPowerVoltage(i, m_channelUIState[i].m_committedSetCurrent);
+			}
 			HelpMarker("Maximum current to be supplied to the load.\n\nChanges are not pushed to hardware until you click Apply.");
 
 			ImGui::TreePop();
@@ -210,7 +249,8 @@ void PowerSupplyDialog::ChannelSettings(int i, float v, float a, float etime)
 		{
 			ImGui::BeginDisabled();
 				ImGui::SetNextItemWidth(valueWidth);
-				ImGui::InputFloat("V###VMeasured", &v);
+				auto svolts = volts.PrettyPrint(v);
+				ImGui::InputText("Voltage###VMeasured", &svolts);
 			ImGui::EndDisabled();
 
 			if(!cc && m_channelUIState[i].m_outputEnabled && !shdn)
@@ -225,7 +265,8 @@ void PowerSupplyDialog::ChannelSettings(int i, float v, float a, float etime)
 
 			ImGui::BeginDisabled();
 				ImGui::SetNextItemWidth(valueWidth);
-				ImGui::InputFloat("A###AMeasured", &a);
+				auto scurr = amps.PrettyPrint(a);
+				ImGui::InputText("Current###IMeasured", &scurr);
 			ImGui::EndDisabled();
 
 			if(cc && m_channelUIState[i].m_outputEnabled && !shdn)

@@ -35,6 +35,9 @@
 #include "ngscopeclient.h"
 #include "MainWindow.h"
 
+#include "DemoOscilloscope.h"
+#include "RemoteBridgeOscilloscope.h"
+
 //Dock builder API is not yet public, so might change...
 #include "imgui_internal.h"
 
@@ -42,9 +45,14 @@
 #include "AddGeneratorDialog.h"
 #include "AddMultimeterDialog.h"
 #include "AddPowerSupplyDialog.h"
+#include "AddRFGeneratorDialog.h"
 #include "AddScopeDialog.h"
+#include "ChannelPropertiesDialog.h"
 #include "FunctionGeneratorDialog.h"
+#include "LogViewerDialog.h"
 #include "MultimeterDialog.h"
+#include "RFGeneratorDialog.h"
+#include "SCPIConsoleDialog.h"
 
 using namespace std;
 
@@ -55,14 +63,11 @@ MainWindow::MainWindow(vk::raii::Queue& queue)
 	: VulkanWindow("ngscopeclient", queue)
 	, m_showDemo(true)
 	, m_showPlot(false)
+	, m_nextWaveformGroup(1)
 	, m_session(this)
 {
-	m_waveformGroups.push_back(make_shared<WaveformGroup>("Waveform Group 1", 2));
-	m_waveformGroups.push_back(make_shared<WaveformGroup>("Waveform Group 2", 3));
-
 	LoadRecentInstrumentList();
 
-	//Set up a better font.
 	//Add default Latin-1 glyph ranges plus some Greek letters and symbols we use
 	ImGuiIO& io = ImGui::GetIO();
 	ImFontGlyphRangesBuilder builder;
@@ -71,16 +76,46 @@ MainWindow::MainWindow(vk::raii::Queue& queue)
 	for(wchar_t i=0x370; i<=0x3ff; i++)	//Greek and Coptic
 		builder.AddChar(i);
 
+	//Build the range of glyphs we're using for the font
 	ImVector<ImWchar> ranges;
 	builder.BuildRanges(&ranges);
 
-	auto font = io.Fonts->AddFontFromFileTTF(
-		FindDataFile("fonts/DejaVuSans.ttf").c_str(),
-		13,
-		nullptr,
-		ranges.Data);
+	//Load our fonts
+	m_defaultFont = LoadFont("fonts/DejaVuSans.ttf", 13, ranges);
+	m_monospaceFont = LoadFont("fonts/DejaVuSansMono.ttf", 13, ranges);
+
+	//Done loading fonts, build the texture
+	io.Fonts->Flags = ImFontAtlasFlags_NoMouseCursors;
 	io.Fonts->Build();
-	io.FontDefault = font;
+	io.FontDefault = m_defaultFont;
+
+	//Temporary command pool for initialization
+	vk::CommandPoolCreateInfo poolInfo(
+		vk::CommandPoolCreateFlagBits::eTransient | vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+		g_renderQueueType );
+	vk::raii::CommandPool pool(*g_vkComputeDevice, poolInfo);
+	vk::CommandBufferAllocateInfo bufinfo(*pool, vk::CommandBufferLevel::ePrimary, 1);
+	vk::raii::CommandBuffer cmdBuf(move(vk::raii::CommandBuffers(*g_vkComputeDevice, bufinfo).front()));
+
+	//Download imgui fonts
+	cmdBuf.begin({});
+	ImGui_ImplVulkan_CreateFontsTexture(*cmdBuf);
+	cmdBuf.end();
+	SubmitAndBlock(cmdBuf, queue);
+	ImGui_ImplVulkan_DestroyFontUploadObjects();
+
+	//Load some textures
+	//TODO: use preference to decide what size to make the icons
+	m_texmgr.LoadTexture("foo", FindDataFile("icons/24x24/trigger-start.png"));
+	m_texmgr.LoadTexture("clear-sweeps", FindDataFile("icons/24x24/clear-sweeps.png"));
+	m_texmgr.LoadTexture("fullscreen-enter", FindDataFile("icons/24x24/fullscreen-enter.png"));
+	m_texmgr.LoadTexture("fullscreen-exit", FindDataFile("icons/24x24/fullscreen-exit.png"));
+	m_texmgr.LoadTexture("history", FindDataFile("icons/24x24/history.png"));
+	m_texmgr.LoadTexture("refresh-settings", FindDataFile("icons/24x24/refresh-settings.png"));
+	m_texmgr.LoadTexture("trigger-single", FindDataFile("icons/24x24/trigger-single.png"));
+	m_texmgr.LoadTexture("trigger-force", FindDataFile("icons/24x24/trigger-single.png"));	//no dedicated icon yet
+	m_texmgr.LoadTexture("trigger-start", FindDataFile("icons/24x24/trigger-start.png"));
+	m_texmgr.LoadTexture("trigger-stop", FindDataFile("icons/24x24/trigger-stop.png"));
 }
 
 MainWindow::~MainWindow()
@@ -93,15 +128,130 @@ MainWindow::~MainWindow()
 
 void MainWindow::CloseSession()
 {
-	//TODO: clear the actual session object
+	LogTrace("Closing session\n");
+
+	//Clear the actual session object
+	m_session.Clear();
 
 	SaveRecentInstrumentList();
 
+	//Destroy waveform views
+	m_waveformGroups.clear();
+	m_newWaveformGroups.clear();
+	m_splitRequests.clear();
+
 	//Clear any open dialogs before destroying the session.
 	//This ensures that we have a nice well defined shutdown order.
+	m_logViewerDialog = nullptr;
 	m_meterDialogs.clear();
+	m_channelPropertiesDialogs.clear();
 	m_generatorDialogs.clear();
+	m_rfgeneratorDialogs.clear();
 	m_dialogs.clear();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Add views for new instruments
+
+string MainWindow::NameNewWaveformGroup()
+{
+	//TODO: avoid colliding, check if name is in use and skip if so
+	int id = (m_nextWaveformGroup ++);
+	return string("Waveform Group ") + to_string(id);
+}
+
+/**
+	@brief Figure out what group to use for a newly added stream, based on unit compatibility etc
+ */
+shared_ptr<WaveformGroup> MainWindow::GetBestGroupForWaveform(StreamDescriptor /*stream*/)
+{
+	//If we have no waveform groups, make one
+	//TODO: reject existing group if units are incompatible
+	if(m_waveformGroups.empty())
+	{
+		//Make the group
+		auto name = NameNewWaveformGroup();
+		auto group = make_shared<WaveformGroup>(this, name);
+		m_waveformGroups.push_back(group);
+
+		//Group is newly created and not yet docked
+		m_newWaveformGroups.push_back(group);
+	}
+
+	//Get the first compatible waveform group (may or may not be what we just created)
+	//TODO: reject existing group if units are incompatible
+	return *m_waveformGroups.begin();
+}
+
+void MainWindow::OnScopeAdded(Oscilloscope* scope)
+{
+	LogTrace("Oscilloscope \"%s\" added\n", scope->m_nickname.c_str());
+	LogIndenter li;
+
+	//Add areas to it
+	//For now, one area per enabled channel
+	vector<StreamDescriptor> streams;
+
+	//Headless scope? Pick every channel.
+	if( (dynamic_cast<RemoteBridgeOscilloscope*>(scope)) || (dynamic_cast<DemoOscilloscope*>(scope)) )
+	{
+		LogTrace("Headless scope, enabling every analog channel\n");
+		for(size_t i=0; i<scope->GetChannelCount(); i++)
+		{
+			auto chan = scope->GetChannel(i);
+			for(size_t j=0; j<chan->GetStreamCount(); j++)
+			{
+				if(chan->GetType(j) == Stream::STREAM_TYPE_ANALOG)
+					streams.push_back(StreamDescriptor(chan, j));
+			}
+		}
+
+		//Handle pure logic analyzers
+		if(streams.empty())
+		{
+			LogTrace("No analog channels found. Must be a logic analyzer. Enabling every digital channel\n");
+
+			for(size_t i=0; i<scope->GetChannelCount(); i++)
+			{
+				auto chan = scope->GetChannel(i);
+				for(size_t j=0; j<chan->GetStreamCount(); j++)
+				{
+					if(chan->GetType(j) == Stream::STREAM_TYPE_DIGITAL)
+						streams.push_back(StreamDescriptor(chan, j));
+				}
+			}
+		}
+	}
+
+	//Use whatever was enabled when we connected
+	else
+	{
+		for(size_t i=0; i<scope->GetChannelCount(); i++)
+		{
+			auto chan = scope->GetChannel(i);
+			if(!chan->IsEnabled())
+				continue;
+
+			for(size_t j=0; j<chan->GetStreamCount(); j++)
+				streams.push_back(StreamDescriptor(chan, j));
+		}
+		LogTrace("%zu streams were active when we connected\n", streams.size());
+
+		//No streams? Grab the first one.
+		if(streams.empty())
+		{
+			LogTrace("Enabling first channel\n");
+			streams.push_back(StreamDescriptor(scope->GetChannel(0), 0));
+		}
+	}
+
+	//Add waveform areas for the streams
+	for(auto s : streams)
+	{
+		auto group = GetBestGroupForWaveform(s);
+		auto area = make_shared<WaveformArea>(s, group, this);
+		group->AddArea(area);
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -116,13 +266,20 @@ void MainWindow::RenderUI()
 {
 	//Menu for main window
 	MainMenu();
+	Toolbar();
 
 	//Docking area to put all of the groups in
 	DockingArea();
 
 	//Waveform groups
-	for(auto g : m_waveformGroups)
-		g->Render();
+	vector<size_t> groupsToClose;
+	for(size_t i=0; i<m_waveformGroups.size(); i++)
+	{
+		if(!m_waveformGroups[i]->Render())
+			groupsToClose.push_back(i);
+	}
+	for(ssize_t i = static_cast<ssize_t>(groupsToClose.size())-1; i >= 0; i--)
+		m_waveformGroups.erase(m_waveformGroups.begin() + i);
 
 	//Dialog boxes
 	set< shared_ptr<Dialog> > dlgsToClose;
@@ -132,476 +289,127 @@ void MainWindow::RenderUI()
 			dlgsToClose.emplace(dlg);
 	}
 	for(auto& dlg : dlgsToClose)
-	{
-		//Multimeter dialogs are stored in a separate list as well
-		auto meterDlg = dynamic_pointer_cast<MultimeterDialog>(dlg);
-		if(meterDlg)
-			m_meterDialogs.erase(meterDlg->GetMeter());
-
-		//Function generator dialogs are stored in a separate list as well
-		auto genDlg = dynamic_pointer_cast<FunctionGeneratorDialog>(dlg);
-		if(genDlg)
-			m_generatorDialogs.erase(genDlg->GetGenerator());
-
-		m_dialogs.erase(dlg);
-	}
+		OnDialogClosed(dlg);
 
 	//DEBUG: draw the demo windows
 	ImGui::ShowDemoWindow(&m_showDemo);
 	//ImPlot::ShowDemoWindow(&m_showPlot);
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Top level menu
-
-void MainWindow::AddDialog(shared_ptr<Dialog> dlg)
+void MainWindow::Toolbar()
 {
-	m_dialogs.emplace(dlg);
+	//Toolbar should be at the top of the main window.
+	//Update work area size so docking area doesn't include the toolbar rectangle
+	auto viewport = ImGui::GetMainViewport();
+	auto toolbarHeight = ImGui::GetFontSize() * 2.5;
+	m_workPos = ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + toolbarHeight);
+	m_workSize = ImVec2(viewport->WorkSize.x, viewport->WorkSize.y - toolbarHeight);
+	ImGui::SetNextWindowPos(viewport->WorkPos);
+	ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, toolbarHeight));
 
-	auto mdlg = dynamic_cast<MultimeterDialog*>(dlg.get());
-	if(mdlg != nullptr)
-		m_meterDialogs[mdlg->GetMeter()] = dlg;
+	//Make the toolbar window
+	auto wflags =
+		ImGuiWindowFlags_NoDocking |
+		ImGuiWindowFlags_NoMove |
+		ImGuiWindowFlags_NoTitleBar |
+		ImGuiWindowFlags_NoResize |
+		ImGuiWindowFlags_NoScrollbar |
+		ImGuiWindowFlags_NoSavedSettings |
+		ImGuiWindowFlags_NoCollapse;
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+	bool open = true;
+	ImGui::Begin("toolbar", &open, wflags);
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
 
-	auto fdlg = dynamic_cast<FunctionGeneratorDialog*>(dlg.get());
-	if(fdlg != nullptr)
-		m_generatorDialogs[fdlg->GetGenerator()] = dlg;
+	//Do the actual toolbar buttons
+	ToolbarButtons();
+
+	ImGui::PopStyleColor();
+	ImGui::PopStyleVar(2);
+
+	ImGui::End();
 }
 
-/**
-	@brief Run the top level menu bar
- */
-void MainWindow::MainMenu()
+void MainWindow::ToolbarButtons()
 {
-	if(ImGui::BeginMainMenuBar())
+	auto sz = 24;//ImGui::GetFontSize() * 2;
+	ImVec2 buttonsize(sz, sz);
+
+	//Trigger button group
+	if(ImGui::ImageButton("trigger-start", GetTexture("trigger-start"), buttonsize))
+		LogDebug("start trigger\n");
+
+	ImGui::SameLine(0.0, 0.0);
+	if(ImGui::ImageButton("trigger-single", GetTexture("trigger-single"), buttonsize))
+		LogDebug("single trigger\n");
+
+	ImGui::SameLine(0.0, 0.0);
+	if(ImGui::ImageButton("trigger-force", GetTexture("trigger-force"), buttonsize))
+		LogDebug("force trigger\n");
+
+	ImGui::SameLine(0.0, 0.0);
+	if(ImGui::ImageButton("trigger-stop", GetTexture("trigger-stop"), buttonsize))
+		LogDebug("stop trigger\n");
+
+	//History selector
+	ImGui::SameLine();
+	if(ImGui::ImageButton("history", GetTexture("history"), buttonsize))
+		LogDebug("history\n");
+
+	//Refresh scope settings
+	ImGui::SameLine();
+	if(ImGui::ImageButton("refresh-settings", GetTexture("refresh-settings"), buttonsize))
+		LogDebug("refresh settings\n");
+
+	//View settings
+	ImGui::SameLine();
+	if(ImGui::ImageButton("clear-sweeps", GetTexture("clear-sweeps"), buttonsize))
+		LogDebug("clear-sweeps\n");
+
+	//Fullscreen toggle
+	ImGui::SameLine(0.0, 0.0);
+	if(m_fullscreen)
 	{
-		FileMenu();
-		ViewMenu();
-		AddMenu();
-		WindowMenu();
-		HelpMenu();
-		ImGui::EndMainMenuBar();
+		if(ImGui::ImageButton("fullscreen-exit", GetTexture("fullscreen-exit"), buttonsize))
+			SetFullscreen(false);
+	}
+	else
+	{
+		if(ImGui::ImageButton("fullscreen-enter", GetTexture("fullscreen-enter"), buttonsize))
+			SetFullscreen(true);
 	}
 }
 
-/**
-	@brief Run the File menu
- */
-void MainWindow::FileMenu()
+void MainWindow::OnDialogClosed(const std::shared_ptr<Dialog>& dlg)
 {
-	if(ImGui::BeginMenu("File"))
-	{
-		if(ImGui::MenuItem("Exit"))
-			glfwSetWindowShouldClose(m_window, 1);
+	//Multimeter dialogs are stored in a separate list
+	auto meterDlg = dynamic_pointer_cast<MultimeterDialog>(dlg);
+	if(meterDlg)
+		m_meterDialogs.erase(meterDlg->GetMeter());
 
-		ImGui::EndMenu();
-	}
-}
+	//Function generator dialogs are stored in a separate list
+	auto genDlg = dynamic_pointer_cast<FunctionGeneratorDialog>(dlg);
+	if(genDlg)
+		m_generatorDialogs.erase(genDlg->GetGenerator());
 
-/**
-	@brief Run the View menu
- */
-void MainWindow::ViewMenu()
-{
-	if(ImGui::BeginMenu("View"))
-	{
-		if(ImGui::MenuItem("Fullscreen"))
-			SetFullscreen(!m_fullscreen);
+	//RF generator dialogs are stored in a separate list
+	auto rgenDlg = dynamic_pointer_cast<RFGeneratorDialog>(dlg);
+	if(rgenDlg)
+		m_rfgeneratorDialogs.erase(rgenDlg->GetGenerator());
 
-		ImGui::EndMenu();
-	}
-}
+	if(m_logViewerDialog == dlg)
+		m_logViewerDialog = nullptr;
 
-/**
-	@brief Run the Add menu
- */
-void MainWindow::AddMenu()
-{
-	if(ImGui::BeginMenu("Add"))
-	{
-		//Make a reverse mapping: timestamp -> instruments last used at that time
-		map<time_t, vector<string> > reverseMap;
-		for(auto it : m_recentInstruments)
-			reverseMap[it.second].push_back(it.first);
+	auto conDlg = dynamic_pointer_cast<SCPIConsoleDialog>(dlg);
+	if(conDlg)
+		m_scpiConsoleDialogs.erase(conDlg->GetInstrument());
 
-		//Get a sorted list of timestamps, most recent first, with no duplicates
-		set<time_t> timestampsDeduplicated;
-		for(auto it : m_recentInstruments)
-			timestampsDeduplicated.emplace(it.second);
-		vector<time_t> timestamps;
-		for(auto t : timestampsDeduplicated)
-			timestamps.push_back(t);
-		std::sort(timestamps.begin(), timestamps.end());
+	auto chanDlg = dynamic_pointer_cast<ChannelPropertiesDialog>(dlg);
+	if(chanDlg)
+		m_channelPropertiesDialogs.erase(chanDlg->GetChannel());
 
-		AddGeneratorMenu(timestamps, reverseMap);
-		AddMultimeterMenu(timestamps, reverseMap);
-		AddOscilloscopeMenu(timestamps, reverseMap);
-		AddPowerSupplyMenu(timestamps, reverseMap);
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Add | Generator menu
- */
-void MainWindow::AddGeneratorMenu(vector<time_t>& timestamps, map<time_t, vector<string> >& reverseMap)
-{
-	if(ImGui::BeginMenu("Generator"))
-	{
-		if(ImGui::MenuItem("Connect..."))
-			m_dialogs.emplace(make_shared<AddGeneratorDialog>(m_session));
-		ImGui::Separator();
-
-		//Find all known function generator drivers.
-		//Any recent instrument using one of these drivers is assumed to be a generator.
-		vector<string> drivers;
-		SCPIFunctionGenerator::EnumDrivers(drivers);
-		set<string> driverset;
-		for(auto s : drivers)
-			driverset.emplace(s);
-
-		//Recent instruments
-		for(int i=timestamps.size()-1; i>=0; i--)
-		{
-			auto t = timestamps[i];
-			auto cstrings = reverseMap[t];
-			for(auto cstring : cstrings)
-			{
-				auto fields = explode(cstring, ':');
-				auto nick = fields[0];
-				auto drivername = fields[1];
-				auto transname = fields[2];
-
-				if(driverset.find(drivername) != driverset.end())
-				{
-					if(ImGui::MenuItem(nick.c_str()))
-					{
-						auto path = fields[3];
-						for(size_t j=4; j<fields.size(); j++)
-							path = path + ":" + fields[j];
-
-						auto transport = MakeTransport(transname, path);
-						if(transport != nullptr)
-						{
-							//Create the scope
-							auto gen = SCPIFunctionGenerator::CreateFunctionGenerator(drivername, transport);
-							if(gen == nullptr)
-							{
-								ShowErrorPopup(
-									"Driver error",
-									"Failed to create function generator driver of type \"" + drivername + "\"");
-								delete transport;
-							}
-
-							else
-							{
-								//TODO: apply preferences
-								LogDebug("FIXME: apply PreferenceManager settings to newly created generator\n");
-
-								gen->m_nickname = nick;
-								m_session.AddFunctionGenerator(gen);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Add | Multimeter menu
- */
-void MainWindow::AddMultimeterMenu(vector<time_t>& timestamps, map<time_t, vector<string> >& reverseMap)
-{
-	if(ImGui::BeginMenu("Multimeter"))
-	{
-		if(ImGui::MenuItem("Connect..."))
-			m_dialogs.emplace(make_shared<AddMultimeterDialog>(m_session));
-		ImGui::Separator();
-
-		//Find all known multimeter drivers.
-		//Any recent instrument using one of these drivers is assumed to be a multimeter.
-		vector<string> drivers;
-		SCPIMultimeter::EnumDrivers(drivers);
-		set<string> driverset;
-		for(auto s : drivers)
-			driverset.emplace(s);
-
-		//Recent instruments
-		for(int i=timestamps.size()-1; i>=0; i--)
-		{
-			auto t = timestamps[i];
-			auto cstrings = reverseMap[t];
-			for(auto cstring : cstrings)
-			{
-				auto fields = explode(cstring, ':');
-				auto nick = fields[0];
-				auto drivername = fields[1];
-				auto transname = fields[2];
-
-				if(driverset.find(drivername) != driverset.end())
-				{
-					if(ImGui::MenuItem(nick.c_str()))
-					{
-						auto path = fields[3];
-						for(size_t j=4; j<fields.size(); j++)
-							path = path + ":" + fields[j];
-
-						auto transport = MakeTransport(transname, path);
-						if(transport != nullptr)
-						{
-							//Create the scope
-							auto meter = SCPIMultimeter::CreateMultimeter(drivername, transport);
-							if(meter == nullptr)
-							{
-								ShowErrorPopup(
-									"Driver error",
-									"Failed to create multimeter driver of type \"" + drivername + "\"");
-								delete transport;
-							}
-
-							else
-							{
-								//TODO: apply preferences
-								LogDebug("FIXME: apply PreferenceManager settings to newly created meter\n");
-
-								meter->m_nickname = nick;
-								m_session.AddMultimeter(meter);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Add | Oscilloscope menu
- */
-void MainWindow::AddOscilloscopeMenu(vector<time_t>& timestamps, map<time_t, vector<string> >& reverseMap)
-{
-	if(ImGui::BeginMenu("Oscilloscope"))
-	{
-		if(ImGui::MenuItem("Connect..."))
-			m_dialogs.emplace(make_shared<AddScopeDialog>(m_session));
-		ImGui::Separator();
-
-		//Find all known scope drivers.
-		//Any recent instrument using one of these drivers is assumed to be a scope.
-		vector<string> drivers;
-		Oscilloscope::EnumDrivers(drivers);
-		set<string> driverset;
-		for(auto s : drivers)
-			driverset.emplace(s);
-
-		//Recent instruments
-		for(int i=timestamps.size()-1; i>=0; i--)
-		{
-			auto t = timestamps[i];
-			auto cstrings = reverseMap[t];
-			for(auto cstring : cstrings)
-			{
-				auto fields = explode(cstring, ':');
-				auto nick = fields[0];
-				auto drivername = fields[1];
-				auto transname = fields[2];
-
-				if(driverset.find(drivername) != driverset.end())
-				{
-					if(ImGui::MenuItem(nick.c_str()))
-					{
-						auto path = fields[3];
-						for(size_t j=4; j<fields.size(); j++)
-							path = path + ":" + fields[j];
-
-						auto transport = MakeTransport(transname, path);
-						if(transport != nullptr)
-						{
-							//Create the scope
-							auto scope = Oscilloscope::CreateOscilloscope(drivername, transport);
-							if(scope == nullptr)
-							{
-								ShowErrorPopup(
-									"Driver error",
-									"Failed to create oscilloscope driver of type \"" + drivername + "\"");
-								delete transport;
-							}
-
-							else
-							{
-								//TODO: apply preferences
-								LogDebug("FIXME: apply PreferenceManager settings to newly created scope\n");
-
-								scope->m_nickname = nick;
-								m_session.AddOscilloscope(scope);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Add | Power Supply menu
- */
-void MainWindow::AddPowerSupplyMenu(vector<time_t>& timestamps, map<time_t, vector<string> >& reverseMap)
-{
-	if(ImGui::BeginMenu("Power Supply"))
-	{
-		if(ImGui::MenuItem("Connect..."))
-			m_dialogs.emplace(make_shared<AddPowerSupplyDialog>(m_session));
-
-		ImGui::Separator();
-
-		//Find all known PSU drivers.
-		//Any recent instrument using one of these drivers is assumed to be a PSU.
-		vector<string> drivers;
-		SCPIPowerSupply::EnumDrivers(drivers);
-		set<string> driverset;
-		for(auto s : drivers)
-			driverset.emplace(s);
-
-		//Recent instruments
-		for(int i=timestamps.size()-1; i>=0; i--)
-		{
-			auto t = timestamps[i];
-			auto cstrings = reverseMap[t];
-			for(auto cstring : cstrings)
-			{
-				auto fields = explode(cstring, ':');
-				auto nick = fields[0];
-				auto drivername = fields[1];
-				auto transname = fields[2];
-
-				if(driverset.find(drivername) != driverset.end())
-				{
-					if(ImGui::MenuItem(nick.c_str()))
-					{
-						auto path = fields[3];
-						for(size_t j=4; j<fields.size(); j++)
-							path = path + ":" + fields[j];
-
-						auto transport = MakeTransport(transname, path);
-						if(transport != nullptr)
-						{
-							//Create the PSU
-							auto psu = SCPIPowerSupply::CreatePowerSupply(drivername, transport);
-							if(psu == nullptr)
-							{
-								ShowErrorPopup(
-									"Driver error",
-									"Failed to create PSU driver of type \"" + drivername + "\"");
-								delete transport;
-							}
-
-							else
-							{
-								//TODO: apply preferences
-								LogDebug("FIXME: apply PreferenceManager settings to newly created PSU\n");
-
-								psu->m_nickname = nick;
-								m_session.AddPowerSupply(psu);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Window menu
- */
-void MainWindow::WindowMenu()
-{
-	if(ImGui::BeginMenu("Window"))
-	{
-		WindowGeneratorMenu();
-		WindowMultimeterMenu();
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Window | Generator menu
-
-	This menu is used for connecting to a function generator that is part of an oscilloscope.
- */
-void MainWindow::WindowGeneratorMenu()
-{
-	if(ImGui::BeginMenu("Generator"))
-	{
-		auto scopes = m_session.GetScopes();
-		for(auto scope : scopes)
-		{
-			//Is the scope also a function generator? If not, skip it
-			if( (scope->GetInstrumentTypes() & Instrument::INST_FUNCTION) == 0)
-				continue;
-
-			//Do we already have a dialog open for it? If so, don't make another
-			auto generator = dynamic_cast<SCPIFunctionGenerator*>(scope);
-			if(m_generatorDialogs.find(generator) != m_generatorDialogs.end())
-				continue;
-
-			//Add it to the menu
-			if(ImGui::MenuItem(generator->m_nickname.c_str()))
-				m_session.AddFunctionGenerator(generator);
-		}
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Window | Multimeter menu
- */
-void MainWindow::WindowMultimeterMenu()
-{
-	if(ImGui::BeginMenu("Multimeter"))
-	{
-		auto scopes = m_session.GetScopes();
-		for(auto scope : scopes)
-		{
-			//Is the scope also a multimeter? If not, skip it
-			if( (scope->GetInstrumentTypes() & Instrument::INST_DMM) == 0)
-				continue;
-
-			//Do we already have a dialog open for it? If so, don't make another
-			auto meter = dynamic_cast<SCPIMultimeter*>(scope);
-			if(m_meterDialogs.find(meter) != m_meterDialogs.end())
-				continue;
-
-			//Add it to the menu
-			if(ImGui::MenuItem(scope->m_nickname.c_str()))
-				m_session.AddMultimeter(meter);
-		}
-
-		ImGui::EndMenu();
-	}
-}
-
-/**
-	@brief Run the Help menu
- */
-void MainWindow::HelpMenu()
-{
-	if(ImGui::BeginMenu("Help"))
-	{
-		ImGui::EndMenu();
-	}
+	m_dialogs.erase(dlg);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -611,8 +419,8 @@ void MainWindow::DockingArea()
 {
 	//Provide a space we can dock windows into
 	auto viewport = ImGui::GetMainViewport();
-	ImGui::SetNextWindowPos(viewport->WorkPos);
-	ImGui::SetNextWindowSize(viewport->WorkSize);
+	ImGui::SetNextWindowPos(m_workPos);
+	ImGui::SetNextWindowSize(m_workSize);
 	ImGui::SetNextWindowViewport(viewport->ID);
 
 	ImGuiWindowFlags host_window_flags = 0;
@@ -630,33 +438,117 @@ void MainWindow::DockingArea()
 	ImGui::PopStyleVar(3);
 
 	auto dockspace_id = ImGui::GetID("DockSpace");
-	ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), /*dockspace_flags*/0, /*window_class*/nullptr);
-	ImGui::End();
 
-	//DEBUG: do initial split of our waveform groups into the dock space
-	static bool first = true;
-	if(first)
+	//Handle splitting of existing waveform groups
+	if(!m_splitRequests.empty())
 	{
-		//Clear out existing docks
-		ImGui::DockBuilderRemoveNode(dockspace_id);
-		ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
-		ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+		LogTrace("Processing split request\n");
 
-		ImGuiID idLeft;
-		ImGuiID idRight;
-		/*auto idParent =*/ ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.5, &idLeft, &idRight);
+		for(auto request : m_splitRequests)
+		{
+			//Get the window for the group
+			auto window = ImGui::FindWindowByName(request.m_group->GetTitle().c_str());
+			if(!window)
+			{
+				//Not sure if this is possible? Haven't seen it yet
+				LogWarning("Window is null (TODO handle this)\n");
+				continue;
+			}
+			if(!window->DockNode)
+			{
+				//If we get here, we dragged into a floating window without a dock space in it
+				LogWarning("Dock node is null (TODO handle this)\n");
+				continue;
+			}
 
-		ImGui::DockBuilderDockWindow(m_waveformGroups[0]->GetTitle().c_str(), idLeft);
-		ImGui::DockBuilderDockWindow(m_waveformGroups[1]->GetTitle().c_str(), idRight);
+			auto dockid = window->DockId;
 
+			//Split the existing node
+			ImGuiID idA;
+			ImGuiID idB;
+			ImGui::DockBuilderSplitNode(dockid, request.m_direction, 0.5, &idA, &idB);
+			auto node = ImGui::DockBuilderGetNode(idA);
+
+			//Create a new waveform group and dock it into the new space
+			auto group = make_shared<WaveformGroup>(this, NameNewWaveformGroup());
+			m_waveformGroups.push_back(group);
+			ImGui::DockBuilderDockWindow(group->GetTitle().c_str(), node->ID);
+
+			//Add a new waveform area for our stream to the new group
+			auto area = make_shared<WaveformArea>(request.m_stream, group, this);
+			group->AddArea(area);
+		}
+
+		//Finish up
 		ImGui::DockBuilderFinish(dockspace_id);
 
-		first = false;
+		m_splitRequests.clear();
 	}
+
+	//Handle newly created waveform groups
+	//Do not do this the same frame as split requests
+	else if(!m_newWaveformGroups.empty())
+	{
+		LogTrace("Processing newly added waveform group\n");
+
+		//Find the top/leftmost leaf node in the docking tree
+		auto topNode = ImGui::DockBuilderGetNode(dockspace_id);
+		if(topNode == nullptr)
+		{
+			LogError("Top dock node is null when adding new waveform group\n");
+			return;
+		}
+
+		//Traverse down the top/left of the tree as long as such a node exists
+		auto node = topNode;
+		while(node->ChildNodes[0])
+			node = node->ChildNodes[0];
+
+		//See if the node has children in it
+		if(!node->Windows.empty())
+		{
+			LogTrace("Windows already in node, splitting it\n");
+			ImGuiID idLeft;
+			ImGuiID idRight;
+
+			ImGui::DockBuilderSplitNode(node->ID, ImGuiDir_Up, 0.5, &idLeft, &idRight);
+			node = ImGui::DockBuilderGetNode(idLeft);
+		}
+
+		//Dock new waveform groups by default
+		for(auto& g : m_newWaveformGroups)
+			ImGui::DockBuilderDockWindow(g->GetTitle().c_str(), node->ID);
+
+		//Finish up
+		ImGui::DockBuilderFinish(dockspace_id);
+
+		//Everything pending has been docked, no need to do anything with them in the future
+		m_newWaveformGroups.clear();
+	}
+
+	ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), /*dockspace_flags*/0, /*window_class*/nullptr);
+	ImGui::End();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Other GUI handlers
+
+void MainWindow::ShowChannelProperties(OscilloscopeChannel* channel)
+{
+	LogTrace("Show properties for %s\n", channel->GetHwname().c_str());
+	LogIndenter li;
+
+	if(m_channelPropertiesDialogs.find(channel) != m_channelPropertiesDialogs.end())
+	{
+		LogTrace("Properties dialog is already open, no action required\n");
+		return;
+	}
+
+	//Dialog wasn't already open, create it
+	auto dlg = make_shared<ChannelPropertiesDialog>(channel);
+	m_channelPropertiesDialogs[channel] = dlg;
+	AddDialog(dlg);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Recent instruments
@@ -762,7 +654,7 @@ SCPITransport* MainWindow::MakeTransport(const string& trans, const string& args
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Error messages
+// Dialog helpers
 
 /**
 	@brief Opens the error popup
@@ -786,5 +678,18 @@ void MainWindow::RenderErrorPopup()
 		if(ImGui::Button("OK"))
 			ImGui::CloseCurrentPopup();
 		ImGui::EndPopup();
+	}
+}
+
+/**
+	@brief Closes the function generator dialog, if we have one
+ */
+void MainWindow::RemoveFunctionGenerator(SCPIFunctionGenerator* gen)
+{
+	auto it = m_generatorDialogs.find(gen);
+	if(it != m_generatorDialogs.end())
+	{
+		m_generatorDialogs.erase(gen);
+		m_dialogs.erase(it->second);
 	}
 }

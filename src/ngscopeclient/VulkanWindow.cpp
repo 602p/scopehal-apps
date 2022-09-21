@@ -97,7 +97,7 @@ VulkanWindow::VulkanWindow(const string& title, vk::raii::Queue& queue)
 	poolSizes.push_back(vk::DescriptorPoolSize(vk::DescriptorType::eUniformBufferDynamic, numImguiDescriptors));
 	poolSizes.push_back(vk::DescriptorPoolSize(vk::DescriptorType::eStorageBufferDynamic, numImguiDescriptors));
 	poolSizes.push_back(vk::DescriptorPoolSize(vk::DescriptorType::eInputAttachment, numImguiDescriptors));
-	vk::DescriptorPoolCreateInfo poolInfo(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, poolSizes);
+	vk::DescriptorPoolCreateInfo poolInfo(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, numImguiDescriptors, poolSizes);
 	m_imguiDescriptorPool = make_unique<vk::raii::DescriptorPool>(*g_vkComputeDevice, poolInfo);
 
 	UpdateFramebuffer();
@@ -125,7 +125,7 @@ VulkanWindow::VulkanWindow(const string& title, vk::raii::Queue& queue)
 	ImGui_ImplGlfw_InitForVulkan(m_window, true);
 	ImGui_ImplVulkan_InitInfo info = {};
 	info.Instance = **g_vkInstance;
-	info.PhysicalDevice = **g_vkfftPhysicalDevice;
+	info.PhysicalDevice = **g_vkComputePhysicalDevice;
 	info.Device = **g_vkComputeDevice;
 	info.QueueFamily = g_renderQueueType;
 	info.PipelineCache = **g_pipelineCacheMgr->Lookup("ImGui.spv", IMGUI_VERSION_NUM);
@@ -156,29 +156,34 @@ VulkanWindow::~VulkanWindow()
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Rendering
 
-void VulkanWindow::UpdateFramebuffer()
+/**
+	@brief Updates the framebuffer
+ */
+bool VulkanWindow::UpdateFramebuffer()
 {
+	LogTrace("Recreating framebuffer due to window resize\n");
+
+	//Wait until any previous rendering has finished
+	g_vkComputeDevice->waitIdle();
+
 	//Get current size of the surface
-	auto caps = g_vkfftPhysicalDevice->getSurfaceCapabilitiesKHR(**m_surface);
+	//If size doesn't match up, early out. We're probably in the middle of a resize.
+	//(This will be corrected next frame, so no worries)
+	auto caps = g_vkComputePhysicalDevice->getSurfaceCapabilitiesKHR(**m_surface);
 	glfwGetFramebufferSize(m_window, &m_width, &m_height);
-	if (caps.maxImageExtent.width < m_width)
+	if( (caps.maxImageExtent.width < (unsigned int)m_width) ||
+		(caps.maxImageExtent.height < (unsigned int)m_height) ||
+		(caps.minImageExtent.width > (unsigned int)m_width) ||
+		(caps.minImageExtent.height > (unsigned int)m_height) )
 	{
-		LogError("Surface not capable of framebuffer width\n");
-		abort();
-	}
-	if (caps.maxImageExtent.height < m_height)
-	{
-		LogError("Surface not capable of framebuffer height\n");
-		abort();
+		LogTrace("Size mismatch, retry after everything has caught up\n");
+		return false;
 	}
 
 	float xscale;
 	float yscale;
 	glfwGetWindowContentScale(m_window, &xscale, &yscale);
 	LogTrace("Scale: %.2f, %.2f\n", xscale, yscale);
-
-	//Wait until any previous rendering has finished
-	g_vkComputeDevice->waitIdle();
 
 	const VkFormat requestSurfaceImageFormat[] =
 	{
@@ -189,7 +194,7 @@ void VulkanWindow::UpdateFramebuffer()
 	};
 	const VkColorSpaceKHR requestSurfaceColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
 	auto format = ImGui_ImplVulkanH_SelectSurfaceFormat(
-		**g_vkfftPhysicalDevice,
+		**g_vkComputePhysicalDevice,
 		**m_surface,
 		requestSurfaceImageFormat,
 		(size_t)IM_ARRAYSIZE(requestSurfaceImageFormat),
@@ -269,13 +274,18 @@ void VulkanWindow::UpdateFramebuffer()
 	}
 
 	m_resizeEventPending = false;
+	return true;
 }
 
 void VulkanWindow::Render()
 {
 	//If we're re-rendering after the window size changed, fix up the framebuffer before we worry about anything else
 	if(m_resizeEventPending)
-		UpdateFramebuffer();
+	{
+		//If resize fails, wait a frame and try again. Don't redraw onto the incomplete framebuffer.
+		if(!UpdateFramebuffer())
+			return;
+	}
 
 	//Start frame
 	ImGui_ImplVulkan_NewFrame();
@@ -294,10 +304,23 @@ void VulkanWindow::Render()
 	if(!main_is_minimized)
 	{
 		//Get the next frame to draw onto
-		auto result = m_swapchain->acquireNextImage(UINT64_MAX, **m_imageAcquiredSemaphores[m_semaphoreIndex], {});
-		m_frameIndex = result.second;
-		if (result.first == vk::Result::eErrorOutOfDateKHR || result.first == vk::Result::eSuboptimalKHR)
+		try
 		{
+			auto result = m_swapchain->acquireNextImage(UINT64_MAX, **m_imageAcquiredSemaphores[m_semaphoreIndex], {});
+			m_frameIndex = result.second;
+			if(result.first == vk::Result::eSuboptimalKHR)
+			{
+				LogTrace("eSuboptimalKHR\n");
+				m_resizeEventPending = true;
+				ImGui::UpdatePlatformWindows();
+				ImGui::RenderPlatformWindowsDefault();
+				Render();
+				return;
+			}
+		}
+		catch(const vk::OutOfDateKHRError& err)
+		{
+			LogTrace("OutOfDateKHR\n");
 			m_resizeEventPending = true;
 			ImGui::UpdatePlatformWindows();
 			ImGui::RenderPlatformWindowsDefault();
@@ -350,27 +373,23 @@ void VulkanWindow::Render()
 	if(!main_is_minimized)
 	{
 		vk::PresentInfoKHR presentInfo(**m_renderCompleteSemaphores[m_semaphoreIndex], **m_swapchain, m_frameIndex);
+		m_semaphoreIndex = (m_semaphoreIndex + 1) % m_backBuffers.size();
 		try
 		{
 			if(vk::Result::eSuboptimalKHR == m_renderQueue.presentKHR(presentInfo))
 			{
+				LogTrace("eSuboptimal at present\n");
 				m_resizeEventPending = true;
-				Render();
 				return;
 			}
 		}
 		catch(const vk::OutOfDateKHRError& err)
 		{
+			LogTrace("OutOfDateKHRError at present\n");
 			m_resizeEventPending = true;
-			Render();
 			return;
 		}
-		m_semaphoreIndex = (m_semaphoreIndex + 1) % m_backBuffers.size();
 	}
-
-	//Handle resize events
-	if(m_resizeEventPending)
-		Render();
 }
 
 void VulkanWindow::RenderUI()
