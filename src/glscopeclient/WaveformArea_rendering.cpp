@@ -191,6 +191,11 @@ void WaveformArea::PrepareGeometry(WaveformRenderData* wdata, bool update_wavefo
 	//Download actual waveform timestamps and voltages
 	if(update_waveform)
 	{
+		if ((sandat || uandat) && !wdata->m_mappedYBuffer)
+			LogFatal("Waveform was analog but did not map analog Y buffer. Wrong Stream type?\n");
+		if ((sdigdat || udigdat) && !wdata->m_mappedDigitalYBuffer)
+			LogFatal("Waveform was digital but did not map digital Y buffer. Wrong Stream type?\n");
+
 		if(sandat)
 			memcpy(wdata->m_mappedYBuffer, sandat->m_samples.GetCpuPointer(), wdata->m_count*sizeof(float));
 		else if(uandat)
